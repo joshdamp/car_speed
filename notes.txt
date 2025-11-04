@@ -1,0 +1,4 @@
+bus stop, other cars moving the bus will also have a record.
+not real time speed detection only recording the initial
+detecting not real vehicle esp in big vehicles like bus
+leaving traces 
