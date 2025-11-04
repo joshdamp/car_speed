@@ -4,13 +4,11 @@ from collections import defaultdict
 import math
 
 # Constants
-PIXELS_PER_METER = 8.8  # Calibration constant - may need adjustment for your camera angle
+PIXELS_PER_METER = 8.8
 FRAMES_PER_SECOND = 18
-MIN_DETECTION_AREA = 1500  # Increased to filter out motorcycles and small noise
-TRACKING_THRESHOLD = 100  # Adjusted for perspective distortion
+MIN_DETECTION_AREA = 1200  # Minimum area to consider as valid detection
+TRACKING_THRESHOLD = 80  # Reduced from 150 - stricter tracking to prevent false associations
 NMS_THRESHOLD = 0.15  # Very aggressive - merge if any overlap exists
-MIN_SPEED_THRESHOLD = 3  # km/h - filter out detection noise
-MIN_FRAMES_FOR_SPEED = 25  # Need more frames due to perspective
 
 def apply_nms(detections, nms_threshold=NMS_THRESHOLD):
     """Apply Non-Maximum Suppression with merging to remove overlapping detections"""
@@ -75,28 +73,21 @@ def merge_boxes(boxes):
     return [x_min, y_min, w, h]
 
 def preprocess_frame(gray):
-    """Apply preprocessing optimized for elevated highway camera angle"""
-    # Apply CLAHE for better contrast in varying lighting
+    """Apply preprocessing to improve vehicle detection"""
+    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) for better contrast
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     
-    # Bilateral filter to reduce noise while preserving edges
-    # Important for separating vehicles from road markings
-    filtered = cv2.bilateralFilter(enhanced, 9, 75, 75)
-    
-    # Apply morphological operations
+    # Apply morphological operations to clean up the image
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     
-    # Closing: fill small holes and connect vehicle parts
-    closed = cv2.morphologyEx(filtered, cv2.MORPH_CLOSE, kernel)
+    # Closing: fill small holes inside objects
+    closed = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel)
     
-    # Opening: remove road marking noise
+    # Opening: remove small noise
     opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
     
-    # Dilation to strengthen vehicle detection
-    dilated = cv2.dilate(opened, kernel, iterations=1)
-    
-    return dilated
+    return opened
 
 class VehicleTracker:
     def __init__(self):
@@ -280,18 +271,18 @@ class VehicleTracker:
             if current_frame_number - last_frame > 5:
                 continue  # Skip stale detections
             
-            # Calculate speed only after vehicle has been tracked for enough frames
-            # Using MIN_FRAMES_FOR_SPEED for better stability with perspective
+            # Calculate speed only after vehicle has been tracked for at least 20 frames
+            # This prevents spurious detections and ensures reliable speed measurement
             speed = None
-            if len(data['positions']) >= MIN_FRAMES_FOR_SPEED:
+            if len(data['positions']) >= 20:
                 speed = self.calculate_speed(vid)
             
             # Update speeds with real-time values
-            # Only store speed if vehicle is actually moving (using MIN_SPEED_THRESHOLD)
-            if speed is not None and speed > MIN_SPEED_THRESHOLD:
+            # Only store speed if vehicle is actually moving (> 5 km/h to avoid noise)
+            if speed is not None and speed > 5:
                 self.speeds[vid] = speed
                 self.tracked_vehicles.add(vid)
-            elif vid in self.speeds and (speed is None or speed <= MIN_SPEED_THRESHOLD):
+            elif vid in self.speeds and (speed is None or speed <= 2):
                 # Remove speed if vehicle has stopped
                 del self.speeds[vid]
             
@@ -346,13 +337,12 @@ def main():
         # Apply preprocessing to improve detection
         gray = preprocess_frame(gray)
         
-        # Detect vehicles - optimized for elevated camera angle
+        # Detect vehicles
         cars = car_cascade.detectMultiScale(
             gray, 
-            scaleFactor=1.08,  # Balanced for perspective variation
-            minNeighbors=7,  # Slightly less strict to catch vehicles at different distances
-            minSize=(50, 50),  # Filter motorcycles and small noise
-            maxSize=(300, 200)  # Prevent extremely large false positives
+            scaleFactor=1.05,  # Changed from 1.1 - more selective
+            minNeighbors=8,  # Increased from 6 - much stricter
+            minSize=(50, 50)  # Increased from (40,40) - filter smaller detections
         )
         
         # Filter detections by area
