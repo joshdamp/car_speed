@@ -199,8 +199,8 @@ class VehicleTracker:
         to_remove = []
         for vid, data in self.vehicles.items():
             last_frame = data['positions'][-1][2]
-            # Remove if not seen in 15 frames (shorter than before for quicker cleanup)
-            if last_frame < frame_number - 15:
+            # Remove if not seen in 25 frames (increased from 15 for longer display)
+            if last_frame < frame_number - 25:
                 to_remove.append(vid)
         
         for vid in to_remove:
@@ -218,13 +218,14 @@ class VehicleTracker:
         
         positions = self.vehicles[vehicle_id]['positions']
         
-        # Need at least 10 frames for reliable speed calculation
-        if len(positions) < 10:
+        # Need at least 5 frames for reliable speed calculation
+        # Reduced from 8 for faster detection
+        if len(positions) < 5:
             return None
         
-        # Use last 10 positions for stable, reliable speed measurement
-        # This reduces noise from detection jitter
-        recent_positions = positions[-10:]
+        # Use last 5 positions for faster speed measurement
+        # Reduced from 8 to get much faster speed detection
+        recent_positions = positions[-5:]
         
         # Calculate average speed over recent frames
         speeds = []
@@ -266,15 +267,15 @@ class VehicleTracker:
         for vid, data in self.vehicles.items():
             bbox = data['bbox']
             
-            # Only display vehicles that were detected in recent frames (within last 5 frames)
+            # Only display vehicles that were detected in recent frames (within last 10 frames)
             last_frame = data['positions'][-1][2]
-            if current_frame_number - last_frame > 5:
+            if current_frame_number - last_frame > 10:
                 continue  # Skip stale detections
             
-            # Calculate speed only after vehicle has been tracked for at least 20 frames
-            # This prevents spurious detections and ensures reliable speed measurement
+            # Calculate speed after vehicle has been tracked for at least 10 frames
+            # Reduced from 15 for much faster speed identification
             speed = None
-            if len(data['positions']) >= 20:
+            if len(data['positions']) >= 10:
                 speed = self.calculate_speed(vid)
             
             # Update speeds with real-time values
