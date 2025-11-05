@@ -170,10 +170,11 @@ class VehicleTracker:
         """Update vehicle positions and calculate speeds"""
         current_centroids = []
         
-        # Calculate centroids of current detections
+        # Calculate bottom-center points of current detections (road contact point)
+        # More stable for large vehicles as bbox grows upward
         for (x, y, w, h) in detections:
-            cx = x + w // 2
-            cy = y + h // 2
+            cx = x + w // 2  # Center X
+            cy = y + h       # Bottom Y (road contact point)
             current_centroids.append((cx, cy, x, y, w, h))
         
         # Match current detections with existing vehicles
