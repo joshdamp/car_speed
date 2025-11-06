@@ -1,121 +1,53 @@
 import cv2
 import numpy as np
-from collections import defaultdict
 import math
 
-# Constants
+# Detection and tracking configuration
 PIXELS_PER_METER = 8.8
 FRAMES_PER_SECOND = 18
-MIN_DETECTION_AREA = 1200  # Minimum area to consider as valid detection
-TRACKING_THRESHOLD = 150  # Increased to handle fast-moving vehicles
-NMS_THRESHOLD = 0.1  # Extremely aggressive - merge almost any overlap
-DETECTION_CUTOFF_Y = 50  # Y-coordinate where speed detection starts (higher = farther down)
-MAX_FRAMES_UNSEEN = 40  # Increased frames before vehicle is removed (allows temporary occlusions)
-
-def apply_nms(detections, nms_threshold=NMS_THRESHOLD):
-    """Apply Non-Maximum Suppression with merging to remove overlapping detections"""
-    if len(detections) <= 1:
-        return detections
-    
-    detections = list(detections)
-    keep = []
-    
-    while detections:
-        # Start with the first detection
-        current = detections.pop(0)
-        merged = [current]
-        
-        # Find all overlapping detections
-        to_remove = []
-        for i, other in enumerate(detections):
-            x1_min = max(current[0], other[0])
-            y1_min = max(current[1], other[1])
-            x1_max = min(current[0] + current[2], other[0] + other[2])
-            y1_max = min(current[1] + current[3], other[1] + other[3])
-            
-            if x1_max > x1_min and y1_max > y1_min:
-                # Calculate IoU
-                intersection = (x1_max - x1_min) * (y1_max - y1_min)
-                area1 = current[2] * current[3]
-                area2 = other[2] * other[3]
-                union = area1 + area2 - intersection
-                iou = intersection / union if union > 0 else 0
-                
-                # If overlapping enough, merge them
-                if iou >= nms_threshold:
-                    merged.append(other)
-                    to_remove.append(i)
-        
-        # Remove merged detections from list (in reverse order to maintain indices)
-        for i in sorted(to_remove, reverse=True):
-            detections.pop(i)
-        
-        # Merge all overlapping boxes into one
-        merged_box = merge_boxes([np.array(m) for m in merged])
-        keep.append(tuple(merged_box))
-    
-    return keep
-
-def merge_boxes(boxes):
-    """Merge multiple overlapping boxes into one"""
-    if len(boxes) == 0:
-        return boxes[0]
-    
-    boxes = np.array(boxes)
-    
-    # Calculate bounding box of all boxes
-    x_min = np.min(boxes[:, 0])
-    y_min = np.min(boxes[:, 1])
-    x_max = np.max(boxes[:, 0] + boxes[:, 2])
-    y_max = np.max(boxes[:, 1] + boxes[:, 3])
-    
-    w = x_max - x_min
-    h = y_max - y_min
-    
-    return [x_min, y_min, w, h]
+MIN_DETECTION_AREA = 2500
+TRACKING_THRESHOLD = 150
+DETECTION_CUTOFF_Y = 50
+MAX_FRAMES_UNSEEN = 40
+BBOX_SMOOTHING_ALPHA = 0.6
+MIN_ASPECT_RATIO = 0.7
+MAX_ASPECT_RATIO = 2.2
 
 def preprocess_frame(gray):
     """Apply preprocessing to improve vehicle detection"""
-    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) for better contrast
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     
-    # Apply morphological operations to clean up the image
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    
-    # Closing: fill small holes inside objects
     closed = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel)
-    
-    # Opening: remove small noise
     opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
     
     return opened
 
-def create_roi_mask(height, width):
-    """Create a Region of Interest mask for the road lanes only"""
-    # Define the road area polygon (hardcoded for highway footage)
-    # Allow detection across the full height but constrain horizontally to road lanes
-    pts = np.array([
-        [0, 0],           # Top-left (allow full height)
-        [width, 0],       # Top-right
-        [width, height],  # Bottom-right
-        [0, height]       # Bottom-left
-    ], np.int32)
-    
-    mask = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillPoly(mask, [pts], 255)
-    return mask
-
 class VehicleTracker:
     def __init__(self):
-        self.vehicles = {}  # Store vehicle positions over time
+        self.vehicles = {}
         self.next_id = 0
-        self.speeds = {}  # Store current speeds (real-time)
-        self.smoothed_speeds = {}  # Store smoothed speeds for better stability
-        self.tracked_vehicles = set()  # Vehicles that have been speed-checked
-        self.speed_history = {}  # Store speed history for each vehicle
-        self.motion_history = {}  # Store motion history to detect stops
-        self.stationary_vehicles = set()  # Vehicles that are confirmed stationary
+        self.speeds = {}
+        self.smoothed_speeds = {}
+        self.tracked_vehicles = set()
+        self.motion_history = {}
+        self.stationary_vehicles = set()
+        self.smoothed_bboxes = {}
+        
+    def smooth_bbox(self, vehicle_id, current_bbox):
+        """Apply exponential smoothing to bounding box to reduce fragmentation jitter"""
+        if vehicle_id not in self.smoothed_bboxes:
+            self.smoothed_bboxes[vehicle_id] = current_bbox
+            return current_bbox
+        
+        prev_bbox = self.smoothed_bboxes[vehicle_id]
+        smoothed = tuple(
+            int(BBOX_SMOOTHING_ALPHA * curr + (1 - BBOX_SMOOTHING_ALPHA) * prev)
+            for curr, prev in zip(current_bbox, prev_bbox)
+        )
+        self.smoothed_bboxes[vehicle_id] = smoothed
+        return smoothed
         
     def get_velocity(self, vehicle_id):
         """Calculate current velocity of a vehicle"""
@@ -162,9 +94,9 @@ class VehicleTracker:
         # Calculate average motion in recent frames
         avg_motion = sum(recent_motions) / len(recent_motions)
         
-        # If average motion is very low (<2 pixels per frame), vehicle is stationary
-        # This is more reliable than checking individual frames
-        return avg_motion < 2.0
+        # If average motion is very low (<3 pixels per frame), vehicle is stationary
+        # Increased threshold to account for smoothing artifacts
+        return avg_motion < 3.0
     
     def update(self, detections, frame_number):
         """Update vehicle positions and calculate speeds"""
@@ -185,6 +117,7 @@ class VehicleTracker:
                     'bbox': (centroid[2], centroid[3], centroid[4], centroid[5]),
                     'first_detected': frame_number
                 }
+                self.smoothed_bboxes[self.next_id] = (centroid[2], centroid[3], centroid[4], centroid[5])
                 self.motion_history[self.next_id] = []
                 self.next_id += 1
         else:
@@ -218,14 +151,24 @@ class VehicleTracker:
                 
                 if min_id != -1:
                     # Update existing vehicle
+                    # Use smoothed bbox to reduce fragmentation jitter
+                    current_bbox = (centroid[2], centroid[3], centroid[4], centroid[5])
+                    smoothed_bbox = self.smooth_bbox(min_id, current_bbox)
+                    self.vehicles[min_id]['bbox'] = smoothed_bbox
+                    
+                    # Recalculate bottom-center from smoothed bbox for stable tracking
+                    x, y, w, h = smoothed_bbox
+                    smooth_cx = x + w // 2
+                    smooth_cy = y + h  # Bottom center from smoothed bbox
+                    
+                    # Update position with smoothed bottom-center point
                     last_pos = self.vehicles[min_id]['positions'][-1]
-                    motion_distance = math.sqrt((centroid[0] - last_pos[0])**2 + 
-                                               (centroid[1] - last_pos[1])**2)
+                    motion_distance = math.sqrt((smooth_cx - last_pos[0])**2 + 
+                                               (smooth_cy - last_pos[1])**2)
                     
                     self.vehicles[min_id]['positions'].append(
-                        (centroid[0], centroid[1], frame_number)
+                        (smooth_cx, smooth_cy, frame_number)
                     )
-                    self.vehicles[min_id]['bbox'] = (centroid[2], centroid[3], centroid[4], centroid[5])
                     
                     # Track motion history
                     if min_id not in self.motion_history:
@@ -244,6 +187,7 @@ class VehicleTracker:
                         'bbox': (centroid[2], centroid[3], centroid[4], centroid[5]),
                         'first_detected': frame_number
                     }
+                    self.smoothed_bboxes[self.next_id] = (centroid[2], centroid[3], centroid[4], centroid[5])
                     self.motion_history[self.next_id] = []
                     self.next_id += 1
         
@@ -261,6 +205,8 @@ class VehicleTracker:
                 del self.speeds[vid]
             if vid in self.smoothed_speeds:
                 del self.smoothed_speeds[vid]
+            if vid in self.smoothed_bboxes:
+                del self.smoothed_bboxes[vid]
             if vid in self.tracked_vehicles:
                 self.tracked_vehicles.discard(vid)
             if vid in self.stationary_vehicles:
@@ -276,12 +222,12 @@ class VehicleTracker:
         
         positions = self.vehicles[vehicle_id]['positions']
         
-        # Need at least 5 frames for reliable speed calculation
-        if len(positions) < 5:
+        # Need at least 10 frames for reliable speed calculation (more stable)
+        if len(positions) < 10:
             return None
         
-        # Use last 5 positions for faster speed measurement
-        recent_positions = positions[-5:]
+        # Use last 10 positions for more stable speed measurement
+        recent_positions = positions[-10:]
         
         # Calculate speeds between consecutive frames
         speeds = []
@@ -339,10 +285,15 @@ class VehicleTracker:
         for vid, data in self.vehicles.items():
             bbox = data['bbox']
             
-            # Only display vehicles that were detected in recent frames (within last 10 frames)
+            # Only display vehicles that were detected in recent frames (within last 30 frames)
             last_frame = data['positions'][-1][2]
-            if current_frame_number - last_frame > 10:
-                continue  # Skip stale detections
+            if current_frame_number - last_frame > 20:
+                continue  # Skip stale detections only after 30 frames unseen
+            
+            # Persistence filter: only display if seen for at least 3 consecutive frames
+            # This eliminates one-off noise detections
+            if len(data['positions']) < 2:
+                continue  # Too new, not reliable yet
             
             # Get bounding box for perspective check
             x, y, w, h = bbox
@@ -374,8 +325,8 @@ class VehicleTracker:
                 if vid in self.smoothed_speeds:
                     del self.smoothed_speeds[vid]
             # Otherwise, update speeds with real-time values
-            # Use smoothed speed for display, with threshold of 1 km/h (more sensitive)
-            elif speed is not None and speed > 1:
+            # Use smoothed speed for display, with threshold of 2 km/h (filters out noise)
+            elif speed is not None and speed > 2:
                 self.speeds[vid] = speed
                 self.tracked_vehicles.add(vid)
                 # Remove from stationary set if it starts moving again
@@ -399,7 +350,64 @@ class VehicleTracker:
                 'is_stationary': is_stationary
             })
         
+        # Group nearby vehicles (multiple detections of same vehicle) and keep smallest
+        display_data = self._filter_duplicate_vehicles(display_data)
+        
         return display_data
+    
+    def _filter_duplicate_vehicles(self, display_data):
+        """Filter out duplicate detections of the same vehicle, keep only smallest bbox in each group"""
+        if len(display_data) <= 1:
+            return display_data
+        
+        GROUPING_DISTANCE = 80
+        
+        grouped = []
+        used = set()
+        
+        for i, vehicle in enumerate(display_data):
+            if i in used:
+                continue
+            
+            group = [vehicle]
+            x1, y1, w1, h1 = vehicle['bbox']
+            cx1 = x1 + w1 // 2
+            cy1 = y1 + h1 // 2
+            
+            # Find all nearby vehicles in same area
+            for j, other in enumerate(display_data):
+                if j <= i or j in used:
+                    continue
+                
+                x2, y2, w2, h2 = other['bbox']
+                cx2 = x2 + w2 // 2
+                cy2 = y2 + h2 // 2
+                
+                # Calculate distance between centers
+                dist = math.sqrt((cx1 - cx2)**2 + (cy1 - cy2)**2)
+                
+                # If close enough, they're the same vehicle
+                if dist < GROUPING_DISTANCE:
+                    group.append(other)
+                    used.add(j)
+            
+            # From the group, keep the one with valid speed, or smallest bbox
+            best_vehicle = None
+            
+            # First priority: vehicle with actual speed reading
+            for v in group:
+                if v['has_speed']:
+                    if best_vehicle is None or int(v['speed'].split()[0]) < int(best_vehicle['speed'].split()[0]):
+                        best_vehicle = v
+            
+            # Second priority: if no speed, keep smallest bbox
+            if best_vehicle is None:
+                best_vehicle = min(group, key=lambda v: v['bbox'][2] * v['bbox'][3])
+            
+            grouped.append(best_vehicle)
+            used.add(i)
+        
+        return grouped
 
 def main():
     # Load Haar Cascade
@@ -415,16 +423,6 @@ def main():
     # Get video properties
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    # Initialize background subtractor (MOG2 for dynamic background removal)
-    # Tuned for fast-moving vehicles: lower history = faster adaptation, lower varThreshold = more sensitive
-    bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=30, varThreshold=40, detectShadows=False)
-    
-    # Create ROI mask for the road area
-    roi_mask = create_roi_mask(height, width)
-    
-    # Flag to enable/disable MOG2 (disabled for now - pure Haar cascade works better)
-    use_mog2 = False
     
     # Initialize tracker
     tracker = VehicleTracker()
@@ -450,37 +448,6 @@ def main():
         # Convert to grayscale for detection
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # MOG2 background subtraction disabled - pure Haar cascade works better for this video
-        # If you want to re-enable, set use_mog2 = True above
-        if use_mog2:
-            # Apply MOG2 background subtraction to isolate moving vehicles (only below detection cutoff)
-            fg_mask = bg_subtractor.apply(gray)
-            
-            # Create a mask that only applies background subtraction below the detection zone
-            detection_zone_mask = np.zeros((height, width), dtype=np.uint8)
-            detection_zone_mask[DETECTION_CUTOFF_Y:, :] = 255  # Only the area below the yellow line
-            
-            # Apply the detection zone mask to foreground mask
-            fg_mask = cv2.bitwise_and(fg_mask, detection_zone_mask)
-            
-            # Apply morphological operations to clean up the foreground mask
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
-            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
-            
-            # Apply ROI mask to focus only on road area
-            fg_mask = cv2.bitwise_and(fg_mask, roi_mask)
-            
-            # Combine foreground mask with grayscale for enhanced detection
-            gray_enhanced = cv2.bitwise_and(gray, gray, mask=fg_mask)
-            
-            # For areas above detection cutoff, use original gray (no background subtraction)
-            gray_above_cutoff = gray.copy()
-            gray_above_cutoff[:DETECTION_CUTOFF_Y, :] = gray[:DETECTION_CUTOFF_Y, :]
-            
-            # Blend: use enhanced below cutoff, original above cutoff
-            gray = np.where(detection_zone_mask[:, :, None] > 0, gray_enhanced[:, :, None], gray_above_cutoff[:, :, None]).squeeze()
-        
         # Apply preprocessing to improve detection
         gray = preprocess_frame(gray)
         
@@ -488,19 +455,27 @@ def main():
         cars = car_cascade.detectMultiScale(
             gray, 
             scaleFactor=1.05,  # Standard scale detection
-            minNeighbors=7,  # Stricter - filters out fences and false positives
+            minNeighbors=8,  # Stricter - filters out fences, shadows, and false positives
             minSize=(40, 40)  # Reasonable minimum size
         )
         
-        # Filter detections by area
+        # Filter detections by area and aspect ratio
         valid_cars = []
         for (x, y, w, h) in cars:
-            if w * h > MIN_DETECTION_AREA:
-                valid_cars.append((x, y, w, h))
+            area = w * h
+            aspect_ratio = w / h if h > 0 else 0
+            
+            # Check area constraint
+            if area < MIN_DETECTION_AREA:
+                continue
+            
+            # Check aspect ratio constraint - strict to filter gaps between vehicles and noise
+            if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
+                continue
+            
+            valid_cars.append((x, y, w, h))
         
-        # Apply Non-Maximum Suppression to remove overlapping detections
-        valid_cars = apply_nms(valid_cars)
-        # Update tracker
+        # Update tracker with filtered detections
         tracker.update(valid_cars, frame_number)
         
         # Get display information
@@ -570,7 +545,7 @@ def main():
     out.release()
     cv2.destroyAllWindows()
     
-    # Print summary
+    # Print summary 
     print("\n=== Speed Detection Summary ===")
     print(f"Total tracked vehicles: {tracker.next_id}")
     print(f"Vehicles with speed calculated: {len(tracker.speeds)}")
